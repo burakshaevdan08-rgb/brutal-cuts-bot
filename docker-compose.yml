@@ -1,0 +1,53 @@
+# Запуск одной командой:
+#   cp .env.example .env   (и указать BOT_TOKEN и ADMIN_ID)
+#   docker compose up --build
+
+services:
+  bot:
+    build: .
+    container_name: brutal-cuts-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Внутри compose-сети используем сервисы redis и postgres.
+      USE_REDIS: "True"
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://brutal:brutal@postgres:5432/brutal_cuts
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  redis:
+    image: redis:7-alpine
+    container_name: brutal-cuts-redis
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: brutal-cuts-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: brutal
+      POSTGRES_PASSWORD: brutal
+      POSTGRES_DB: brutal_cuts
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U brutal -d brutal_cuts"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  redis_data:
+  postgres_data:
