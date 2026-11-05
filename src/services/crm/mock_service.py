@@ -14,7 +14,11 @@
 * многочасовые услуги (комплекс — 2 часа) требуют двух свободных часов подряд;
 * программа лояльности по номеру телефона (+ демо-номера).
 
-Состояние хранится в памяти процесса и сбрасывается при перезапуске.
+Состояние (записи и счётчик ID) хранится в памяти и, если задан ``state_path``,
+сохраняется в JSON-файл после каждого изменения и загружается при старте —
+перезапуск бота не освобождает занятые слоты и не сбрасывает нумерацию.
+Дополнительно ``import_appointment`` позволяет подтянуть записи из локальной БД
+(см. ``mock_sync.sync_mock_crm_with_database``).
 """
 
 from __future__ import annotations
@@ -22,15 +26,18 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import hashlib
-import itertools
+import json
 import logging
 import math
+import os
 import random
 import re
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, replace
+from pathlib import Path
 from types import MappingProxyType
-from typing import Final
+from typing import Any, Final
 from zoneinfo import ZoneInfo
 
 from src.services.crm.base import (
@@ -61,6 +68,9 @@ SLOT_STEP_MINUTES: Final[int] = 60
 MIN_LEAD_TIME: Final[dt.timedelta] = dt.timedelta(hours=1)
 MAX_BOOKING_HORIZON_DAYS: Final[int] = 60
 FIRST_RECORD_ID: Final[int] = 48_001
+STATE_FILE_VERSION: Final[int] = 1
+# Записи старше этого срока не загружаются из файла состояния (счётчик ID сохраняется).
+STATE_RETENTION: Final[dt.timedelta] = dt.timedelta(days=7)
 
 # Базовая загрузка мастера «чужими» записями по грейдам (доля занятых часов).
 _GRADE_LOAD: Final[dict[Grade, float]] = {
@@ -242,6 +252,44 @@ def _loyalty_tier(visits: int) -> tuple[str, int]:
     return "Новичок", 0
 
 
+def _appointment_to_dict(appointment: Appointment) -> dict[str, Any]:
+    return {
+        "id": appointment.id,
+        "status": appointment.status.value,
+        "branch_id": appointment.branch_id,
+        "staff_id": appointment.staff_id,
+        "service_id": appointment.service_id,
+        "addon_ids": list(appointment.addon_ids),
+        "starts_at": appointment.starts_at.isoformat(),
+        "ends_at": appointment.ends_at.isoformat(),
+        "client_name": appointment.client_name,
+        "client_phone": appointment.client_phone,
+        "total_price": appointment.total_price,
+        "telegram_id": appointment.telegram_id,
+        "comment": appointment.comment,
+        "created_at": appointment.created_at.isoformat(),
+    }
+
+
+def _appointment_from_dict(raw: dict[str, Any]) -> Appointment:
+    return Appointment(
+        id=int(raw["id"]),
+        status=AppointmentStatus(raw["status"]),
+        branch_id=int(raw["branch_id"]),
+        staff_id=int(raw["staff_id"]),
+        service_id=int(raw["service_id"]),
+        addon_ids=tuple(int(item) for item in raw.get("addon_ids", [])),
+        starts_at=dt.datetime.fromisoformat(raw["starts_at"]),
+        ends_at=dt.datetime.fromisoformat(raw["ends_at"]),
+        client_name=str(raw.get("client_name", "")),
+        client_phone=str(raw.get("client_phone", "")),
+        total_price=int(raw["total_price"]),
+        telegram_id=raw.get("telegram_id"),
+        comment=str(raw.get("comment", "")),
+        created_at=dt.datetime.fromisoformat(raw["created_at"]),
+    )
+
+
 # ----------------------------------------------------------------------
 # Mock-движок
 # ----------------------------------------------------------------------
@@ -258,18 +306,22 @@ class MockCRMService(BaseCRMService):
         timezone: str = "Europe/Moscow",
         latency_ms: int = 0,
         now_provider: Callable[[], dt.datetime] | None = None,
+        state_path: str | Path | None = None,
     ) -> None:
         """
         :param timezone: часовой пояс клуба (IANA).
         :param latency_ms: средняя имитируемая сетевая задержка каждого вызова.
         :param now_provider: подмена «текущего времени» (для тестов и демо).
+        :param state_path: JSON-файл, в котором сохраняются записи и счётчик ID.
+            ``None`` — состояние живёт только в памяти процесса.
         """
         self._tz = ZoneInfo(timezone)
         self._latency_ms = max(latency_ms, 0)
         self._now_provider = now_provider
 
         self._lock = asyncio.Lock()
-        self._record_ids = itertools.count(FIRST_RECORD_ID)
+        self._next_id = FIRST_RECORD_ID
+        self._state_path = Path(state_path) if state_path else None
         self._appointments: dict[int, Appointment] = {}
 
         self._branches: dict[int, Branch] = {branch.id: branch for branch in _BRANCH_ROWS}
@@ -277,6 +329,7 @@ class MockCRMService(BaseCRMService):
         self._staff: dict[int, Staff] = {}
         self._shifts: dict[int, _ShiftPattern] = {}
         self._load_staff()
+        self._load_state()
 
     # ------------------------------------------------------------------
     # Публичный интерфейс
@@ -383,7 +436,7 @@ class MockCRMService(BaseCRMService):
             )
 
             appointment = Appointment(
-                id=next(self._record_ids),
+                id=self._allocate_id(),
                 status=AppointmentStatus.PENDING,
                 branch_id=booking_data.branch_id,
                 staff_id=booking_data.staff_id,
@@ -399,6 +452,7 @@ class MockCRMService(BaseCRMService):
                 created_at=self._now(),
             )
             self._appointments[appointment.id] = appointment
+            await self._persist()
 
         logger.info(
             "Mock CRM: создана запись #%s (%s, %s, %s ₽)",
@@ -419,6 +473,7 @@ class MockCRMService(BaseCRMService):
                 raise CRMValidationError("Нельзя отменить запись, которая уже началась.")
             cancelled = replace(appointment, status=AppointmentStatus.CANCELLED)
             self._appointments[record_id] = cancelled
+            await self._persist()
 
         logger.info("Mock CRM: запись #%s отменена", record_id)
         return cancelled
@@ -433,6 +488,7 @@ class MockCRMService(BaseCRMService):
                 return appointment
             confirmed = replace(appointment, status=AppointmentStatus.CONFIRMED)
             self._appointments[record_id] = confirmed
+            await self._persist()
 
         logger.info("Mock CRM: запись #%s подтверждена", record_id)
         return confirmed
@@ -458,6 +514,132 @@ class MockCRMService(BaseCRMService):
             tier=tier,
             discount_percent=discount,
         )
+
+    # ------------------------------------------------------------------
+    # Импорт записей из внешнего источника (локальная БД)
+    # ------------------------------------------------------------------
+
+    @property
+    def timezone(self) -> ZoneInfo:
+        """Часовой пояс клуба."""
+        return self._tz
+
+    async def import_appointment(self, appointment: Appointment) -> tuple[Appointment, str]:
+        """Добавляет в Mock-CRM существующую запись (например, из локальной БД).
+
+        Возвращает ``(запись, результат)``, где результат:
+
+        * ``"exists"``     — такая запись (тот же ID, мастер и время) уже есть;
+        * ``"imported"``   — запись добавлена под своим ID;
+        * ``"reassigned"`` — ID уже занят другой записью (или некорректен), выдан новый:
+          вызывающий код должен обновить ссылку на запись у себя;
+        * ``"conflict"``   — слот мастера уже занят другой активной записью, запись не добавлена.
+
+        Счётчик ID автоматически сдвигается за максимальный импортированный ID.
+        """
+        starts_at = appointment.starts_at.astimezone(self._tz)
+        ends_at = appointment.ends_at.astimezone(self._tz)
+        candidate = replace(appointment, starts_at=starts_at, ends_at=ends_at)
+
+        async with self._lock:
+            existing = self._appointments.get(candidate.id)
+            if (
+                existing is not None
+                and existing.staff_id == candidate.staff_id
+                and existing.starts_at == candidate.starts_at
+            ):
+                return existing, "exists"
+
+            if candidate.is_active and self._overlaps_active(candidate):
+                return candidate, "conflict"
+
+            outcome = "imported"
+            if candidate.id <= 0 or candidate.id in self._appointments:
+                candidate = replace(candidate, id=self._allocate_id())
+                outcome = "reassigned"
+
+            self._appointments[candidate.id] = candidate
+            self._next_id = max(self._next_id, candidate.id + 1)
+            await self._persist()
+        return candidate, outcome
+
+    def _occupied_until(self, appointment: Appointment) -> dt.datetime:
+        """Конец занятых часовых окон записи (с округлением вверх до часа)."""
+        minutes = int((appointment.ends_at - appointment.starts_at).total_seconds() // 60)
+        slots = self._slots_needed(minutes)
+        return appointment.starts_at + dt.timedelta(minutes=slots * SLOT_STEP_MINUTES)
+
+    def _overlaps_active(self, candidate: Appointment) -> bool:
+        candidate_end = self._occupied_until(candidate)
+        for other in self._appointments.values():
+            if not other.is_active or other.staff_id != candidate.staff_id:
+                continue
+            if other.starts_at < candidate_end and self._occupied_until(other) > candidate.starts_at:
+                return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Сохранение состояния
+    # ------------------------------------------------------------------
+
+    def _allocate_id(self) -> int:
+        record_id = self._next_id
+        self._next_id += 1
+        return record_id
+
+    def _load_state(self) -> None:
+        """Загружает записи и счётчик ID из файла состояния (если он есть)."""
+        path = self._state_path
+        if path is None or not path.is_file():
+            return
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            records = [_appointment_from_dict(item) for item in raw["appointments"]]
+            saved_next_id = int(raw.get("next_id", FIRST_RECORD_ID))
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            backup = path.with_suffix(path.suffix + ".corrupt")
+            logger.error("Файл состояния Mock-CRM повреждён (%s), он переименован в %s", exc, backup)
+            with suppress(OSError):
+                os.replace(path, backup)
+            return
+
+        horizon = self._now() - STATE_RETENTION
+        self._appointments = {
+            record.id: record for record in records if record.ends_at.astimezone(self._tz) >= horizon
+        }
+        highest = max((record.id for record in records), default=FIRST_RECORD_ID - 1)
+        self._next_id = max(saved_next_id, highest + 1, FIRST_RECORD_ID)
+        logger.info(
+            "Mock CRM: загружено записей: %s, следующий ID: %s (%s)",
+            len(self._appointments),
+            self._next_id,
+            path,
+        )
+
+    async def _persist(self) -> None:
+        """Атомарно записывает состояние в файл. Ошибка записи не ломает бронирование."""
+        if self._state_path is None:
+            return
+        payload = json.dumps(
+            {
+                "version": STATE_FILE_VERSION,
+                "next_id": self._next_id,
+                "appointments": [_appointment_to_dict(item) for item in self._appointments.values()],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        try:
+            await asyncio.to_thread(self._write_state_file, self._state_path, payload)
+        except OSError:
+            logger.exception("Не удалось сохранить состояние Mock-CRM в %s", self._state_path)
+
+    @staticmethod
+    def _write_state_file(path: Path, payload: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = path.with_suffix(path.suffix + ".tmp")
+        temp_path.write_text(payload, encoding="utf-8")
+        os.replace(temp_path, path)  # атомарная замена: файл не бывает записан наполовину
 
     # ------------------------------------------------------------------
     # Инициализация справочников

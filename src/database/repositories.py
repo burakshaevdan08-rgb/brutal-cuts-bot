@@ -50,6 +50,14 @@ class InvalidStatusTransitionError(RepositoryError):
     """Недопустимый переход между статусами записи."""
 
 
+class SlotTakenError(RepositoryError):
+    """У мастера на это время уже есть активная запись (статус created или confirmed)."""
+
+    def __init__(self, message: str, conflicting_id: int | None = None) -> None:
+        super().__init__(message)
+        self.conflicting_id = conflicting_id
+
+
 class ReviewNotAllowedError(RepositoryError):
     """Отзыв оставить нельзя (визит не завершён, чужая запись или отзыв уже есть)."""
 
@@ -59,6 +67,11 @@ class ReviewNotAllowedError(RepositoryError):
 # ----------------------------------------------------------------------
 
 _PHONE_RE: Final = re.compile(r"^\+\d{10,15}$")
+
+# Длительность визита по умолчанию: для записей без ``datetime_end`` и когда конец не передан.
+DEFAULT_VISIT_DURATION: Final = dt.timedelta(hours=1)
+# Самый длинный визит; нужен, чтобы ограничить выборку кандидатов на пересечение.
+MAX_VISIT_DURATION: Final = dt.timedelta(hours=6)
 
 _ALLOWED_TRANSITIONS: Final[dict[BookingStatus, frozenset[BookingStatus]]] = {
     BookingStatus.CREATED: frozenset(
@@ -268,17 +281,41 @@ class AppointmentRepository:
         service_name: str,
         datetime_start: dt.datetime,
         total_price: int,
+        datetime_end: dt.datetime | None = None,
         addons: Sequence[str] = (),
         beverage: str | None = None,
         silent_cut: bool = False,
         status: BookingStatus = BookingStatus.CREATED,
     ) -> Appointment:
-        """Сохраняет бронь, созданную в CRM."""
+        """Сохраняет бронь, созданную в CRM.
+
+        Если у мастера на это время уже есть активная запись (created / confirmed),
+        бросает ``SlotTakenError``: повторно записаться на тот же слот нельзя.
+        Проверка пропускается для статусов cancelled и completed.
+        """
         _require_aware(datetime_start, "datetime_start")
+        if datetime_end is not None:
+            _require_aware(datetime_end, "datetime_end")
+            if datetime_end <= datetime_start:
+                raise ValueError("datetime_end должен быть позже datetime_start.")
         if total_price < 0:
             raise ValueError("total_price не может быть отрицательным.")
         if await self._session.get(User, user_id) is None:
             raise EntityNotFoundError(f"Пользователь {user_id} не найден.")
+
+        if status in ACTIVE_STATUSES:
+            conflict = await self.find_conflict(
+                branch_id=branch_id,
+                staff_id=staff_id,
+                start=datetime_start,
+                end=datetime_end,
+            )
+            if conflict is not None:
+                raise SlotTakenError(
+                    f"У мастера {staff_name} на {datetime_start.isoformat()} уже есть "
+                    f"активная запись (№{conflict.id}).",
+                    conflicting_id=conflict.id,
+                )
 
         appointment = Appointment(
             user_id=user_id,
@@ -290,6 +327,7 @@ class AppointmentRepository:
             service_name=service_name,
             addons=list(addons),
             datetime_start=datetime_start,
+            datetime_end=datetime_end,
             total_price=total_price,
             beverage=beverage,
             silent_cut=silent_cut,
@@ -298,6 +336,64 @@ class AppointmentRepository:
         self._session.add(appointment)
         await self._session.flush()
         return appointment
+
+    # --- проверка занятости слота ----------------------------------------
+
+    async def find_conflict(
+        self,
+        *,
+        branch_id: int,
+        staff_id: int,
+        start: dt.datetime,
+        end: dt.datetime | None = None,
+        exclude_id: int | None = None,
+    ) -> Appointment | None:
+        """Активная запись мастера, пересекающаяся с интервалом ``[start, end)``.
+
+        Активные — это статусы created и confirmed. Если ``end`` не передан, интервал
+        считается часовым. Записи без ``datetime_end`` трактуются как часовые.
+        Пересечение считается в Python, чтобы не зависеть от арифметики дат конкретной СУБД.
+        """
+        _require_aware(start, "start")
+        new_end = _require_aware(end, "end") if end is not None else start + DEFAULT_VISIT_DURATION
+
+        stmt = select(Appointment).where(
+            Appointment.branch_id == branch_id,
+            Appointment.staff_id == staff_id,
+            Appointment.status.in_(ACTIVE_STATUSES),
+            Appointment.datetime_start < new_end,
+            Appointment.datetime_start > start - MAX_VISIT_DURATION,
+        )
+        if exclude_id is not None:
+            stmt = stmt.where(Appointment.id != exclude_id)
+        stmt = stmt.order_by(Appointment.datetime_start.asc(), Appointment.id.asc())
+
+        for candidate in (await self._session.execute(stmt)).scalars():
+            candidate_end = candidate.datetime_end or candidate.datetime_start + DEFAULT_VISIT_DURATION
+            if candidate.datetime_start < new_end and candidate_end > start:
+                return candidate
+        return None
+
+    async def list_active_since(self, since: dt.datetime) -> list[Appointment]:
+        """Активные записи, начинающиеся не раньше ``since`` (для синхронизации с CRM)."""
+        _require_aware(since, "since")
+        stmt = (
+            select(Appointment)
+            .where(
+                Appointment.status.in_(ACTIVE_STATUSES),
+                Appointment.datetime_start >= since,
+            )
+            .order_by(Appointment.id.asc())
+        )
+        return list((await self._session.execute(stmt)).scalars().all())
+
+    async def set_crm_record_id(self, appointment_id: int, crm_record_id: str | int) -> None:
+        """Обновляет ссылку на запись в CRM (например, после переназначения ID)."""
+        appointment = await self._session.get(Appointment, appointment_id)
+        if appointment is None:
+            raise EntityNotFoundError(f"Запись {appointment_id} не найдена.")
+        appointment.crm_record_id = str(crm_record_id)
+        await self._session.flush()
 
     # --- чтение -------------------------------------------------------
 

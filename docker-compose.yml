@@ -14,6 +14,9 @@ services:
       USE_REDIS: "True"
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql+asyncpg://brutal:brutal@postgres:5432/brutal_cuts
+    volumes:
+      # Состояние Mock-CRM (data/mock_crm_state.json) переживает пересоздание контейнера.
+      - bot_data:/app/data
     depends_on:
       redis:
         condition: service_healthy
@@ -49,5 +52,6 @@ services:
       retries: 10
 
 volumes:
+  bot_data:
   redis_data:
   postgres_data:

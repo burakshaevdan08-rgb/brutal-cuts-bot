@@ -23,8 +23,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Final
 
-from sqlalchemy import event
-from sqlalchemy.engine import URL, make_url
+from sqlalchemy import event, inspect, text
+from sqlalchemy.engine import URL, Connection, make_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -112,6 +112,45 @@ def create_engine(database_url: str = DEFAULT_DATABASE_URL, *, echo: bool = Fals
 
 
 # ----------------------------------------------------------------------
+# Лёгкая миграция схемы
+# ----------------------------------------------------------------------
+
+
+def _add_missing_columns(connection: Connection) -> None:
+    """Добавляет в существующие таблицы колонки, появившиеся после первого запуска.
+
+    ``create_all`` создаёт только отсутствующие таблицы и не меняет уже созданные,
+    поэтому локальный файл SQLite от прошлой версии остаётся без новых колонок.
+    Добавляются только nullable-колонки — для них ``ALTER TABLE ADD COLUMN`` безопасен
+    и в SQLite, и в PostgreSQL. Для серьёзных изменений схемы используйте Alembic.
+    """
+    inspector = inspect(connection)
+    preparer = connection.dialect.identifier_preparer
+    for table in Base.metadata.sorted_tables:
+        if not inspector.has_table(table.name):
+            continue
+        existing = {column["name"] for column in inspector.get_columns(table.name)}
+        for column in table.columns:
+            if column.name in existing:
+                continue
+            if not column.nullable:
+                logger.warning(
+                    "В таблице %s нет обязательной колонки %s: пересоздайте БД или примените миграцию.",
+                    table.name,
+                    column.name,
+                )
+                continue
+            ddl_type = column.type.compile(dialect=connection.dialect)
+            connection.execute(
+                text(
+                    f"ALTER TABLE {preparer.quote(table.name)} "
+                    f"ADD COLUMN {preparer.quote(column.name)} {ddl_type}"
+                )
+            )
+            logger.info("Миграция: добавлена колонка %s.%s", table.name, column.name)
+
+
+# ----------------------------------------------------------------------
 # Жизненный цикл
 # ----------------------------------------------------------------------
 
@@ -135,6 +174,7 @@ async def init_db(
     try:
         async with engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
+            await connection.run_sync(_add_missing_columns)
     except Exception:
         await engine.dispose()
         raise

@@ -16,6 +16,7 @@ from src.database.repositories import (
     RepositoryError,
     ReviewNotAllowedError,
     ReviewRepository,
+    SlotTakenError,
     UserRepository,
 )
 from src.database.session import (
@@ -42,6 +43,7 @@ __all__ = [
     "Review",
     "ReviewNotAllowedError",
     "ReviewRepository",
+    "SlotTakenError",
     "User",
     "UserRepository",
     "close_db",

@@ -61,6 +61,13 @@ class Settings(BaseSettings):
         le=5000,
         description="Имитация сетевой задержки Mock-CRM, мс",
     )
+    MOCK_STATE_FILE: str = Field(
+        default="data/mock_crm_state.json",
+        description=(
+            "JSON-файл с состоянием Mock-CRM (записи и счётчик ID). "
+            "Относительный путь считается от корня проекта; none — не сохранять."
+        ),
+    )
 
     # --- YClients -------------------------------------------------
     YCLIENTS_API_URL: str = "https://api.yclients.com/api/v1"
@@ -194,6 +201,15 @@ class Settings(BaseSettings):
         if not self.YCLIENTS_COMPANY_IDS:
             return ()
         return tuple(int(chunk) for chunk in self.YCLIENTS_COMPANY_IDS.split(","))
+
+    @property
+    def mock_state_path(self) -> Path | None:
+        """Абсолютный путь к файлу состояния Mock-CRM или None, если сохранение отключено."""
+        value = self.MOCK_STATE_FILE.strip()
+        if value.lower() in {"", "none", "off", "false", "0"}:
+            return None
+        path = Path(value).expanduser()
+        return path if path.is_absolute() else BASE_DIR / path
 
     @property
     def is_sqlite(self) -> bool:

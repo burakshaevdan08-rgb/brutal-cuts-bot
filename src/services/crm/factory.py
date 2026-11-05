@@ -39,6 +39,7 @@ def build_crm_service(settings: Settings | None = None) -> BaseCRMService:
         return MockCRMService(
             timezone=settings.TIMEZONE,
             latency_ms=settings.MOCK_LATENCY_MS,
+            state_path=settings.mock_state_path,
         )
 
     raise NotImplementedError(

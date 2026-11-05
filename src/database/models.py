@@ -213,6 +213,9 @@ class Appointment(Base):
         server_default=text("'[]'"),
     )
     datetime_start: Mapped[dt.datetime] = mapped_column(UTCDateTime)
+    # Конец визита (начало + длительность услуги). NULL у записей, созданных до появления
+    # колонки: для них длительность считается равной одному часу.
+    datetime_end: Mapped[dt.datetime | None] = mapped_column(UTCDateTime, default=None)
     total_price: Mapped[int] = mapped_column(Integer)
     # Напиток к визиту (клубная опция); None — без напитка.
     beverage: Mapped[str | None] = mapped_column(String(64), default=None)

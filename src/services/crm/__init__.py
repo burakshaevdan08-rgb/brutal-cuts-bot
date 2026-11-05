@@ -17,7 +17,7 @@ from src.services.crm.base import (
     Staff,
 )
 from src.services.crm.factory import build_crm_service, get_crm_service, reset_crm_service
-from src.services.crm.mock_service import MockCRMService
+from src.services.crm.mock_service import MockCRMService, normalize_phone
 
 __all__ = [
     "Appointment",
@@ -37,5 +37,6 @@ __all__ = [
     "Staff",
     "build_crm_service",
     "get_crm_service",
+    "normalize_phone",
     "reset_crm_service",
 ]
