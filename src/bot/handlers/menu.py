@@ -40,7 +40,8 @@ from src.bot.keyboards.booking_kb import (
 from src.bot.states.booking import MenuStates
 from src.core.config import Settings
 from src.database import AppointmentRepository, BookingStatus, UserRepository, session_scope
-from src.services.crm import BaseCRMService, CRMError, CRMNotFoundError, CRMValidationError
+from src.services.booking_actions import cancel_visit
+from src.services.crm import BaseCRMService, CRMError
 
 logger = logging.getLogger(__name__)
 
@@ -274,31 +275,9 @@ async def on_cancel_confirmed(
     crm: BaseCRMService,
 ) -> None:
     """Отмена: сначала в CRM (освобождает слот), затем в локальной БД."""
-    error: str | None = None
-    async with session_scope() as session:
-        repo = AppointmentRepository(session)
-        appointment = await repo.get(callback_data.id, user_id=callback.from_user.id)
-
-        if appointment is None:
-            error = "Запись не найдена."
-        elif appointment.status is BookingStatus.COMPLETED:
-            error = "Завершённую запись отменить нельзя."
-        elif appointment.status is not BookingStatus.CANCELLED:
-            try:
-                await crm.cancel_appointment(int(appointment.crm_record_id))
-            except CRMNotFoundError:
-                # Например, Mock-CRM был перезапущен и «забыл» запись: в БД всё равно отменяем.
-                logger.warning("Запись CRM #%s не найдена при отмене", appointment.crm_record_id)
-            except CRMValidationError as exc:
-                error = str(exc)
-            except (CRMError, ValueError) as exc:
-                logger.exception("Не удалось отменить запись в CRM")
-                error = "Не удалось отменить запись. Попробуйте позже."
-            if error is None:
-                await repo.cancel(appointment.id, user_id=callback.from_user.id)
-
-    if error is not None:
-        await callback.answer(error, show_alert=True)
+    result = await cancel_visit(crm, callback.from_user.id, callback_data.id)
+    if not result.ok:
+        await callback.answer(result.message, show_alert=True)
         return
 
     await callback.answer("Запись отменена")

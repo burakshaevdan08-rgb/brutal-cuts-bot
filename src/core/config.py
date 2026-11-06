@@ -78,6 +78,26 @@ class Settings(BaseSettings):
         description="ID филиалов YClients через запятую",
     )
 
+    # --- Планировщик и напоминания -----------------------------------
+    SCHEDULER_POLL_SECONDS: int = Field(
+        default=60,
+        ge=10,
+        le=3600,
+        description="Как часто планировщик ищет записи для напоминаний, сек",
+    )
+    DIGEST_TIME: str = Field(
+        default="09:30",
+        description="Время утреннего дайджеста барберов (HH:MM, часовой пояс клуба)",
+    )
+    DIGEST_CHAT_ID: int | None = Field(
+        default=None,
+        description="Чат для дайджестов мастеров без личного чата; по умолчанию — ADMIN_ID",
+    )
+    BARBER_CHAT_IDS: str = Field(
+        default="",
+        description="Личные чаты мастеров: 'ID_мастера:chat_id' через запятую, например 1:111,7:222",
+    )
+
     # --- Общие настройки ------------------------------------------
     TIMEZONE: str = "Europe/Moscow"
     LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
@@ -119,6 +139,28 @@ class Settings(BaseSettings):
                 f"Неизвестный часовой пояс '{value}'. Пример: Europe/Moscow."
             ) from exc
         return value
+
+    @field_validator("DIGEST_TIME")
+    @classmethod
+    def _validate_digest_time(cls, value: str) -> str:
+        match = re.fullmatch(r"(\d{1,2}):(\d{2})", value.strip())
+        if match is None or int(match[1]) > 23 or int(match[2]) > 59:
+            raise ValueError("DIGEST_TIME должен быть в формате HH:MM, например 09:30.")
+        return f"{int(match[1]):02d}:{match[2]}"
+
+    @field_validator("BARBER_CHAT_IDS")
+    @classmethod
+    def _validate_barber_chats(cls, value: str) -> str:
+        cleaned = value.replace(" ", "")
+        if not cleaned:
+            return ""
+        for chunk in cleaned.split(","):
+            staff_id, separator, chat_id = chunk.partition(":")
+            if not separator or not staff_id.isdigit() or not chat_id.lstrip("-").isdigit():
+                raise ValueError(
+                    "BARBER_CHAT_IDS: ожидается 'ID_мастера:chat_id' через запятую, например 1:111,7:222."
+                )
+        return cleaned
 
     @field_validator("DATABASE_URL", mode="before")
     @classmethod
@@ -201,6 +243,27 @@ class Settings(BaseSettings):
         if not self.YCLIENTS_COMPANY_IDS:
             return ()
         return tuple(int(chunk) for chunk in self.YCLIENTS_COMPANY_IDS.split(","))
+
+    @property
+    def digest_hour_minute(self) -> tuple[int, int]:
+        hour, minute = self.DIGEST_TIME.split(":")
+        return int(hour), int(minute)
+
+    @property
+    def digest_chat_id(self) -> int:
+        """Чат для дайджестов: DIGEST_CHAT_ID или, если не задан, ADMIN_ID."""
+        return self.DIGEST_CHAT_ID if self.DIGEST_CHAT_ID is not None else self.ADMIN_ID
+
+    @property
+    def barber_chat_ids(self) -> dict[int, int]:
+        """Личные чаты мастеров: ``{ID мастера в CRM: chat_id}``."""
+        if not self.BARBER_CHAT_IDS:
+            return {}
+        result: dict[int, int] = {}
+        for chunk in self.BARBER_CHAT_IDS.split(","):
+            staff_id, _, chat_id = chunk.partition(":")
+            result[int(staff_id)] = int(chat_id)
+        return result
 
     @property
     def mock_state_path(self) -> Path | None:

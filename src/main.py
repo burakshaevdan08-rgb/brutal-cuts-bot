@@ -15,6 +15,7 @@ from aiogram.fsm.storage.redis import RedisStorage
 from src.core.config import Settings, get_settings
 from src.database import close_db, init_db
 from src.bot.handlers import get_routers
+from src.scheduler.scheduler import create_scheduler
 from src.services.crm import get_crm_service
 from src.services.crm.mock_sync import sync_mock_crm_with_database
 
@@ -62,9 +63,20 @@ async def main() -> None:
     except Exception:
         logger.warning("Не удалось отправить стартовое сообщение администратору")
 
+    # Планировщик живёт в том же event loop, что и бот: опрос напоминаний и утренний дайджест.
+    scheduler = create_scheduler(bot, crm, settings)
+    scheduler.start()
+    logger.info(
+        "Планировщик запущен: опрос напоминаний каждые %s с, дайджест барберов в %s (%s)",
+        settings.SCHEDULER_POLL_SECONDS,
+        settings.DIGEST_TIME,
+        settings.TIMEZONE,
+    )
+
     try:
         await dp.start_polling(bot)
     finally:
+        scheduler.shutdown(wait=False)
         await crm.close()
         await close_db()
         await storage.close()

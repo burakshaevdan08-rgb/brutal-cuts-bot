@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import enum
 import re
 from collections.abc import Collection, Sequence
 from typing import Any, Final
@@ -65,6 +66,18 @@ class ReviewNotAllowedError(RepositoryError):
 # ----------------------------------------------------------------------
 # Вспомогательные функции
 # ----------------------------------------------------------------------
+
+class ReminderKind(enum.StrEnum):
+    """Тип напоминания клиенту."""
+
+    H24 = "24h"  # за сутки: подтвердить / перенести / отменить
+    H2 = "2h"    # за 2 часа: навигация до филиала
+
+
+_REMINDER_COLUMNS: Final = {
+    ReminderKind.H24: Appointment.reminder_24h_sent_at,
+    ReminderKind.H2: Appointment.reminder_2h_sent_at,
+}
 
 _PHONE_RE: Final = re.compile(r"^\+\d{10,15}$")
 
@@ -135,6 +148,13 @@ class UserRepository:
         """Пользователь по телефону (первый, если номер привязан к нескольким)."""
         stmt = select(User).where(User.phone == _validate_phone(phone)).limit(1)
         return (await self._session.execute(stmt)).scalars().first()
+
+    async def get_many(self, telegram_ids: Collection[int]) -> dict[int, User]:
+        """Пользователи по списку Telegram ID: ``{telegram_id: User}``."""
+        if not telegram_ids:
+            return {}
+        stmt = select(User).where(User.telegram_id.in_(list(telegram_ids)))
+        return {user.telegram_id: user for user in (await self._session.execute(stmt)).scalars()}
 
     async def create(
         self,
@@ -515,26 +535,34 @@ class AppointmentRepository:
 
     async def get_due_for_reminder(
         self,
+        kind: ReminderKind,
         *,
-        lead_time: dt.timedelta = dt.timedelta(hours=3),
+        lead_time: dt.timedelta,
+        min_remaining: dt.timedelta = dt.timedelta(0),
         now: dt.datetime | None = None,
-        limit: int = 500,
+        limit: int = 200,
     ) -> list[Appointment]:
-        """Активные записи, начинающиеся в ближайшие ``lead_time``, без отправленного напоминания.
+        """Активные записи, которым пора отправить напоминание ``kind``.
+
+        Запись подходит, если она в статусе created / confirmed, напоминание этого типа
+        ещё не отправлялось и до начала визита осталось не больше ``lead_time``,
+        но больше ``min_remaining``. Нижняя граница нужна, чтобы не слать «напоминание
+        за сутки» тому, кто записался на ближайший час.
 
         Типичный цикл планировщика::
 
-            due = await repo.get_due_for_reminder(lead_time=timedelta(hours=3))
+            due = await repo.get_due_for_reminder(ReminderKind.H24, lead_time=timedelta(hours=24))
             ...отправить сообщения...
-            await repo.mark_reminder_sent([a.id for a in due])
+            await repo.mark_reminder_sent(ReminderKind.H24, [a.id for a in due])
         """
         moment = _require_aware(now, "now") if now is not None else utcnow()
+        sent_column = _REMINDER_COLUMNS[kind]
         stmt = (
             select(Appointment)
             .where(
                 Appointment.status.in_(ACTIVE_STATUSES),
-                Appointment.reminder_sent.is_(False),
-                Appointment.datetime_start > moment,
+                sent_column.is_(None),
+                Appointment.datetime_start > moment + min_remaining,
                 Appointment.datetime_start <= moment + lead_time,
             )
             .order_by(Appointment.datetime_start.asc())
@@ -542,16 +570,58 @@ class AppointmentRepository:
         )
         return list((await self._session.execute(stmt)).scalars().all())
 
-    async def mark_reminder_sent(self, appointment_ids: Collection[int]) -> int:
-        """Помечает напоминания отправленными. Возвращает число обновлённых записей."""
+    async def mark_reminder_sent(
+        self,
+        kind: ReminderKind,
+        appointment_ids: Collection[int],
+        *,
+        sent_at: dt.datetime | None = None,
+    ) -> int:
+        """Помечает напоминание ``kind`` отправленным. Возвращает число обновлённых записей."""
         if not appointment_ids:
             return 0
+        moment = _require_aware(sent_at, "sent_at") if sent_at is not None else utcnow()
+        column_name = _REMINDER_COLUMNS[kind].key
         result = await self._session.execute(
             update(Appointment)
             .where(Appointment.id.in_(list(appointment_ids)))
-            .values(reminder_sent=True)
+            .values({column_name: moment})
         )
         return int(result.rowcount or 0)
+
+    async def list_between(
+        self,
+        start: dt.datetime,
+        end: dt.datetime,
+        *,
+        statuses: Collection[BookingStatus] = ACTIVE_STATUSES,
+    ) -> list[Appointment]:
+        """Записи с началом в интервале ``[start, end)`` (по умолчанию только активные).
+
+        Используется утренним дайджестом: ``start`` и ``end`` — границы текущего дня клуба.
+        """
+        _require_aware(start, "start")
+        _require_aware(end, "end")
+        stmt = (
+            select(Appointment)
+            .where(
+                Appointment.status.in_(list(statuses)),
+                Appointment.datetime_start >= start,
+                Appointment.datetime_start < end,
+            )
+            .order_by(Appointment.datetime_start.asc(), Appointment.id.asc())
+        )
+        return list((await self._session.execute(stmt)).scalars().all())
+
+    async def get_last_for_user(self, user_id: int) -> Appointment | None:
+        """Последняя созданная запись клиента (в любом статусе) — для debug-команд."""
+        stmt = (
+            select(Appointment)
+            .where(Appointment.user_id == user_id)
+            .order_by(Appointment.id.desc())
+            .limit(1)
+        )
+        return (await self._session.execute(stmt)).scalars().first()
 
     async def complete_finished(
         self,

@@ -50,6 +50,8 @@ class BookingDraft:
     price_confirmed: bool = False
     beverage: str | None = None  # код напитка из справочника (или "none")
     silent_cut: bool = False
+    # ID записи в БД, которую нужно отменить после успешного создания новой (перенос визита).
+    reschedule_of: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

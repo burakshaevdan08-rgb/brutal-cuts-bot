@@ -235,12 +235,10 @@ class Appointment(Base):
         ),
         default=BookingStatus.CREATED,
     )
-    # Напоминание уже отправлено — чтобы планировщик не слал его повторно.
-    reminder_sent: Mapped[bool] = mapped_column(
-        Boolean,
-        default=False,
-        server_default=false(),
-    )
+    # Когда клиенту отправлены напоминания (NULL — ещё не отправлялось).
+    # По одной колонке на каждое напоминание, чтобы планировщик не слал их повторно.
+    reminder_24h_sent_at: Mapped[dt.datetime | None] = mapped_column(UTCDateTime, default=None)
+    reminder_2h_sent_at: Mapped[dt.datetime | None] = mapped_column(UTCDateTime, default=None)
     created_at: Mapped[dt.datetime] = mapped_column(
         UTCDateTime,
         default=utcnow,

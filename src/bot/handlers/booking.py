@@ -77,6 +77,8 @@ from src.bot.states.booking import BookingDraft, BookingStates
 from src.core.config import Settings
 from src.database import AppointmentRepository, SlotTakenError, UserRepository, session_scope
 from src.database.models import Appointment as DbAppointment
+from src.database.models import BookingStatus, utcnow
+from src.services.booking_actions import cancel_visit
 from src.services.crm import (
     BaseCRMService,
     BookingData,
@@ -554,6 +556,62 @@ async def _show_summary(
         parts.insert(0, notice + "\n")
     parts.append("\n<i>Выберите формат визита и нажмите «Записаться».</i>")
     await show_screen(event, "\n".join(parts), silent_kb(draft.silent_cut))
+
+
+async def start_reschedule(
+    event: CallbackQuery,
+    state: FSMContext,
+    crm: BaseCRMService,
+    settings: Settings,
+    appointment: DbAppointment,
+) -> str | None:
+    """Перенос визита: запускает сценарий с уже выбранными филиалом, услугой, допами и мастером.
+
+    Клиенту остаётся выбрать новые дату и время. Прежняя запись отменяется только
+    после успешного создания новой (см. ``_finalize_booking``).
+    Возвращает текст ошибки, если перенос невозможен, иначе ``None``.
+    """
+    if appointment.status not in (BookingStatus.CREATED, BookingStatus.CONFIRMED):
+        return "Эта запись уже неактуальна."
+    if appointment.datetime_start <= utcnow():
+        return "Визит уже начался, перенести его нельзя."
+
+    services, staff = await asyncio.gather(
+        catalog.services(crm, appointment.branch_id),
+        catalog.staff(crm, appointment.branch_id),
+    )
+    service = next(
+        (item for item in services if not item.is_addon and item.title == appointment.service_name),
+        None,
+    )
+    master = next((member for member in staff if member.id == appointment.staff_id), None)
+    if service is None or master is None:
+        return "Услуга или мастер изменились. Запишитесь заново через меню."
+
+    addon_titles = set(appointment.addons or [])
+    beverage_code = next(
+        (item.code for item in BEVERAGES_BY_CODE.values() if item.label == appointment.beverage),
+        NO_BEVERAGE_CODE,
+    )
+    await state.clear()
+    await _save_draft(
+        state,
+        BookingDraft(
+            branch_id=appointment.branch_id,
+            service_id=service.id,
+            addon_ids=[item.id for item in services if item.is_addon and item.title in addon_titles],
+            any_staff=False,
+            staff_id=master.id,
+            beverage=beverage_code,
+            silent_cut=appointment.silent_cut,
+            reschedule_of=appointment.id,
+        ),
+    )
+    await _show_calendar(
+        event, state, crm, settings,
+        notice="🔄 <b>Перенос визита.</b> Выберите новые дату и время — прежняя запись будет отменена после подтверждения.",
+    )
+    return None
 
 
 # ----------------------------------------------------------------------
@@ -1162,10 +1220,26 @@ async def _finalize_booking(
         )
         return
 
+    header = "🎉 <b>Запись создана!</b>"
+    notes: list[str] = []
+    if draft.reschedule_of is not None:
+        # Перенос: новая запись уже создана, теперь освобождаем прежний слот.
+        header = "🔄 <b>Запись перенесена!</b>"
+        cancelled = await cancel_visit(crm, tg_user.id, draft.reschedule_of)
+        if cancelled.ok:
+            notes += ["♻️ Прежняя запись отменена, её время освобождено.", ""]
+        else:
+            notes += [
+                f"⚠️ Прежнюю запись не удалось отменить автоматически ({esc(cancelled.message)}). "
+                "Отмените её в разделе «📋 Мои записи».",
+                "",
+            ]
+
     view = view_from_appointment(saved, res.branch, settings.tzinfo)
     lines = [
-        format_visit_card(view, header="🎉 <b>Запись создана!</b>"),
+        format_visit_card(view, header=header),
         "",
+        *notes,
         f'💸 <a href="{esc(res.master.netmonet_url)}">Чаевые мастеру через «нетмонет»</a>',
         "⏰ Приходите за 5–10 минут до начала.",
         "Отменить запись можно в разделе «📋 Мои записи».",
