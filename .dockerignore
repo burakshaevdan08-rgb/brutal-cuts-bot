@@ -1,0 +1,14 @@
+.git
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.db
+*.db-wal
+*.db-shm
+data/
+.DS_Store
+.idea/
+.vscode/
+README.md

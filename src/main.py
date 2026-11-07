@@ -8,11 +8,12 @@ import logging
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramUnauthorizedError
 from aiogram.fsm.storage.base import BaseStorage
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.storage.redis import RedisStorage
 from aiogram.types import BotCommand, BotCommandScopeChat, BotCommandScopeDefault
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from src.core.config import Settings, get_settings
 from src.database import close_db, init_db
@@ -62,44 +63,60 @@ async def main() -> None:
     # Создаёт движок и недостающие таблицы (SQLite-файл или PostgreSQL).
     session_factory = await init_db(settings.DATABASE_URL)
     crm = get_crm_service(settings)
-    try:
-        # Mock-CRM подтягивает из БД записи, которых не знает (слоты и счётчик ID).
-        await sync_mock_crm_with_database(crm)
-    except Exception:
-        logger.exception("Не удалось синхронизировать Mock-CRM с БД")
     storage = build_storage(settings)
     bot = Bot(
         token=settings.BOT_TOKEN.get_secret_value(),
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
-    # Всё, что передано в Dispatcher как kwargs, доступно хендлерам по имени параметра.
-    dp = Dispatcher(storage=storage, crm=crm, settings=settings, session_factory=session_factory)
-    for router in get_routers():
-        dp.include_router(router)
-    await setup_bot_commands(bot, settings)
+    scheduler: AsyncIOScheduler | None = None
 
     try:
-        await bot.send_message(
-            settings.ADMIN_ID,
-            f"BRUTAL CUTS запущен. CRM: {'MOCK' if crm.is_mock else 'LIVE'}",
+        # Быстрая проверка токена: понятная ошибка вместо traceback из недр polling.
+        try:
+            me = await bot.get_me()
+        except TelegramUnauthorizedError:
+            logger.critical("Telegram отклонил BOT_TOKEN: проверьте токен в .env (его выдаёт @BotFather).")
+            return
+        logger.info("Бот авторизован: @%s", me.username)
+
+        try:
+            # Mock-CRM подтягивает из БД записи, которых не знает (слоты и счётчик ID).
+            await sync_mock_crm_with_database(crm)
+        except Exception:
+            logger.exception("Не удалось синхронизировать Mock-CRM с БД")
+
+        # Polling и webhook взаимоисключающие: если у токена остался webhook, апдейты не придут.
+        await bot.delete_webhook(drop_pending_updates=False)
+
+        # Всё, что передано в Dispatcher как kwargs, доступно хендлерам по имени параметра.
+        dp = Dispatcher(storage=storage, crm=crm, settings=settings, session_factory=session_factory)
+        for router in get_routers():
+            dp.include_router(router)
+        await setup_bot_commands(bot, settings)
+
+        try:
+            await bot.send_message(
+                settings.ADMIN_ID,
+                f"BRUTAL CUTS запущен. CRM: {'MOCK' if crm.is_mock else 'LIVE'}",
+            )
+        except Exception:
+            logger.warning("Не удалось отправить стартовое сообщение администратору")
+
+        # Планировщик живёт в том же event loop, что и бот: опрос напоминаний и утренний дайджест.
+        scheduler = create_scheduler(bot, crm, settings)
+        scheduler.start()
+        logger.info(
+            "Планировщик запущен: опрос напоминаний каждые %s с, дайджест барберов в %s (%s)",
+            settings.SCHEDULER_POLL_SECONDS,
+            settings.DIGEST_TIME,
+            settings.TIMEZONE,
         )
-    except Exception:
-        logger.warning("Не удалось отправить стартовое сообщение администратору")
+        logger.info("Debug-команды (/test_*) доступны только ADMIN_ID=%s", settings.ADMIN_ID)
 
-    # Планировщик живёт в том же event loop, что и бот: опрос напоминаний и утренний дайджест.
-    scheduler = create_scheduler(bot, crm, settings)
-    scheduler.start()
-    logger.info(
-        "Планировщик запущен: опрос напоминаний каждые %s с, дайджест барберов в %s (%s)",
-        settings.SCHEDULER_POLL_SECONDS,
-        settings.DIGEST_TIME,
-        settings.TIMEZONE,
-    )
-
-    try:
         await dp.start_polling(bot)
     finally:
-        scheduler.shutdown(wait=False)
+        if scheduler is not None and scheduler.running:
+            scheduler.shutdown(wait=False)
         await crm.close()
         await close_db()
         await storage.close()
@@ -107,4 +124,7 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Бот остановлен")
