@@ -2,6 +2,7 @@
 
 * ``process_due_reminders`` — опрос БД (каждые 60 секунд): напоминания за 24 часа
   и за 2 часа до визита;
+* ``process_review_requests`` — запрос оценки через 45 минут после окончания визита;
 * ``send_barber_digests`` — утренний дайджест расписания для мастеров;
 * ``send_reminder_24h`` / ``send_reminder_2h`` — отправка одного напоминания
   (их же используют debug-команды администратора).
@@ -15,6 +16,7 @@ import enum
 import logging
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Final
 
@@ -35,12 +37,22 @@ from src.bot.common import (
     format_date_ru,
     format_price,
     format_visit_card,
+    name_genitive,
     view_from_appointment,
+    visit_phrase,
 )
 from src.bot.keyboards.reminder_kb import reminder_2h_kb, reminder_24h_kb
+from src.bot.keyboards.review_kb import rating_kb
 from src.bot.navigation import format_navigation_block, navigation_url
 from src.core.config import Settings
-from src.database import AppointmentRepository, BookingStatus, ReminderKind, UserRepository, session_scope
+from src.database import (
+    AppointmentRepository,
+    BookingStatus,
+    ReminderKind,
+    RepositoryError,
+    UserRepository,
+    session_scope,
+)
 from src.database.models import Appointment as DbAppointment
 from src.database.models import User, utcnow
 from src.services.crm import BaseCRMService, Branch, Staff
@@ -58,6 +70,11 @@ REMINDER_24H_LEAD: Final = dt.timedelta(hours=24)
 REMINDER_24H_MIN_REMAINING: Final = dt.timedelta(hours=3)
 #: Напоминание №2 (навигация) уходит за два часа до визита.
 REMINDER_2H_LEAD: Final = dt.timedelta(hours=2)
+
+#: Запрос оценки уходит через 45 минут после окончания визита…
+REVIEW_DELAY: Final = dt.timedelta(minutes=45)
+#: …но только по визитам не старше суток (после долгого простоя не засыпаем клиентов старыми).
+REVIEW_LOOKBACK: Final = dt.timedelta(hours=24)
 
 _MESSAGE_LIMIT: Final = 3800  # запас до лимита Telegram в 4096 символов
 
@@ -276,6 +293,113 @@ async def process_due_reminders(
             "Напоминания: за 24 ч — %s, за 2 ч — %s, недоступны — %s, повтор — %s",
             stats.sent_24h,
             stats.sent_2h,
+            stats.unreachable,
+            stats.retry,
+        )
+    return stats
+
+
+# ----------------------------------------------------------------------
+# Запрос оценки после визита
+# ----------------------------------------------------------------------
+
+
+def build_review_request_text(
+    appointment: DbAppointment,
+    settings: Settings,
+    *,
+    test: bool = False,
+    now: dt.datetime | None = None,
+) -> str:
+    """«Как прошла сегодняшняя стрижка у мастера Марка? Оцени работу от 1 до 5 звезд:»."""
+    tz = settings.tzinfo
+    start = appointment.datetime_start.astimezone(tz)
+    today = (now or utcnow()).astimezone(tz).date()
+    phrase = visit_phrase(start, appointment.service_name, today)
+    verb = "прошла" if phrase.endswith("стрижка") else "прошёл"
+    master = name_genitive(appointment.staff_name.split()[0])
+
+    lines: list[str] = []
+    if test:
+        lines.append("🧪 <i>Тестовый запрос оценки (отзыв в базе не сохраняется)</i>")
+        lines.append("")
+    lines.append(f"Как {verb} {phrase} у мастера <b>{esc(master)}</b>?")
+    lines.append("Оцени работу от 1 до 5 звезд:")
+    return "\n".join(lines)
+
+
+async def send_review_request(
+    bot: Bot,
+    appointment: DbAppointment,
+    crm: BaseCRMService,
+    settings: Settings,
+    *,
+    test: bool = False,
+) -> Message:
+    """Сообщение с кнопками [1⭐] … [5⭐]."""
+    text = build_review_request_text(appointment, settings, test=test)
+    return await bot.send_message(
+        appointment.user_id,
+        text,
+        reply_markup=rating_kb(appointment.id, test=test),
+    )
+
+
+@dataclass(slots=True)
+class ReviewStats:
+    """Итог одного прохода запросов оценки."""
+
+    requested: int = 0
+    unreachable: int = 0
+    retry: int = 0
+
+
+async def process_review_requests(
+    bot: Bot,
+    crm: BaseCRMService,
+    settings: Settings,
+    *,
+    now: dt.datetime | None = None,
+) -> ReviewStats:
+    """Отправляет запрос оценки клиентам, чей визит закончился 45 минут назад.
+
+    После отправки визит считается состоявшимся: запись получает статус ``completed``
+    (только завершённый визит можно оценить), а в БД ставится отметка об отправке запроса.
+    """
+    moment = now or utcnow()
+    stats = ReviewStats()
+
+    async with session_scope() as session:
+        due = await AppointmentRepository(session).get_due_for_review(
+            delay=REVIEW_DELAY,
+            lookback=REVIEW_LOOKBACK,
+            now=moment,
+        )
+
+    for appointment in due:
+        outcome = await _deliver(
+            lambda a=appointment: send_review_request(bot, a, crm, settings),
+            appointment.id,
+        )
+        if outcome is _Delivery.RETRY:
+            stats.retry += 1
+            continue
+
+        async with session_scope() as session:
+            repo = AppointmentRepository(session)
+            await repo.mark_review_requested([appointment.id])
+            with suppress(RepositoryError):
+                await repo.complete(appointment.id)
+
+        if outcome is _Delivery.UNREACHABLE:
+            stats.unreachable += 1
+        else:
+            stats.requested += 1
+
+    if stats.requested or stats.unreachable or stats.retry:
+        logger.info(
+            "Запросы оценки: отправлено %s, недоступны %s, повтор %s",
+            stats.requested,
             stats.unreachable,
             stats.retry,
         )

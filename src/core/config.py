@@ -98,6 +98,15 @@ class Settings(BaseSettings):
         description="Личные чаты мастеров: 'ID_мастера:chat_id' через запятую, например 1:111,7:222",
     )
 
+    # --- Отзывы ------------------------------------------------------
+    BRANCH_REVIEW_URLS: str = Field(
+        default="",
+        description=(
+            "Ссылки на отзывы о филиалах на Яндекс.Картах: 'ID_филиала=URL' через ';', "
+            "например 1=https://yandex.ru/maps/org/123/reviews/;2=https://yandex.ru/maps/org/456/reviews/"
+        ),
+    )
+
     # --- Общие настройки ------------------------------------------
     TIMEZONE: str = "Europe/Moscow"
     LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
@@ -147,6 +156,20 @@ class Settings(BaseSettings):
         if match is None or int(match[1]) > 23 or int(match[2]) > 59:
             raise ValueError("DIGEST_TIME должен быть в формате HH:MM, например 09:30.")
         return f"{int(match[1]):02d}:{match[2]}"
+
+    @field_validator("BRANCH_REVIEW_URLS")
+    @classmethod
+    def _validate_review_urls(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            return ""
+        for chunk in cleaned.split(";"):
+            branch_id, separator, url = chunk.strip().partition("=")
+            if not separator or not branch_id.strip().isdigit() or not url.strip().startswith(("https://", "http://")):
+                raise ValueError(
+                    "BRANCH_REVIEW_URLS: ожидается 'ID_филиала=https://...' через ';'."
+                )
+        return cleaned
 
     @field_validator("BARBER_CHAT_IDS")
     @classmethod
@@ -263,6 +286,17 @@ class Settings(BaseSettings):
         for chunk in self.BARBER_CHAT_IDS.split(","):
             staff_id, _, chat_id = chunk.partition(":")
             result[int(staff_id)] = int(chat_id)
+        return result
+
+    @property
+    def branch_review_urls(self) -> dict[int, str]:
+        """Ссылки на отзывы о филиалах: ``{ID филиала: URL}``."""
+        if not self.BRANCH_REVIEW_URLS:
+            return {}
+        result: dict[int, str] = {}
+        for chunk in self.BRANCH_REVIEW_URLS.split(";"):
+            branch_id, _, url = chunk.strip().partition("=")
+            result[int(branch_id.strip())] = url.strip()
         return result
 
     @property

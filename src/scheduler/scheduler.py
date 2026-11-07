@@ -3,7 +3,8 @@
 Задачи:
 
 * ``reminders_poll`` — каждые ``SCHEDULER_POLL_SECONDS`` (по умолчанию 60) секунд
-  ищет в БД записи, которым пора отправить напоминания (за 24 ч и за 2 ч);
+  ищет в БД записи, которым пора отправить напоминания (за 24 ч и за 2 ч)
+  и запросы оценки (через 45 минут после визита);
 * ``barber_digest`` — ежедневно в ``DIGEST_TIME`` (по умолчанию 09:30, часовой пояс клуба)
   рассылает мастерам расписание на день.
 """
@@ -20,7 +21,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from src.core.config import Settings
-from src.scheduler.tasks import process_due_reminders, send_barber_digests
+from src.scheduler.tasks import process_due_reminders, process_review_requests, send_barber_digests
 from src.services.crm import BaseCRMService
 
 logger = logging.getLogger(__name__)
@@ -30,11 +31,18 @@ DIGEST_JOB_ID = "barber_digest"
 
 
 async def _run_reminders(bot: Bot, crm: BaseCRMService, settings: Settings) -> None:
-    """Обёртка: ошибка одного прохода не должна останавливать следующие."""
+    """Один проход опроса БД: напоминания и запросы оценки.
+
+    Задачи изолированы: сбой одной не мешает другой и не останавливает следующие проходы.
+    """
     try:
         await process_due_reminders(bot, crm, settings)
     except Exception:
         logger.exception("Сбой при обработке напоминаний")
+    try:
+        await process_review_requests(bot, crm, settings)
+    except Exception:
+        logger.exception("Сбой при отправке запросов оценки")
 
 
 async def _run_digest(bot: Bot, crm: BaseCRMService, settings: Settings) -> None:
@@ -68,7 +76,7 @@ def create_scheduler(bot: Bot, crm: BaseCRMService, settings: Settings) -> Async
         _run_reminders,
         trigger=IntervalTrigger(seconds=settings.SCHEDULER_POLL_SECONDS),
         id=REMINDERS_JOB_ID,
-        name="Опрос БД: напоминания клиентам",
+        name="Опрос БД: напоминания и запросы оценки",
         kwargs=kwargs,
         next_run_time=dt.datetime.now(settings.tzinfo),
         replace_existing=True,

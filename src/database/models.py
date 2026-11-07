@@ -239,6 +239,8 @@ class Appointment(Base):
     # По одной колонке на каждое напоминание, чтобы планировщик не слал их повторно.
     reminder_24h_sent_at: Mapped[dt.datetime | None] = mapped_column(UTCDateTime, default=None)
     reminder_2h_sent_at: Mapped[dt.datetime | None] = mapped_column(UTCDateTime, default=None)
+    # Когда клиенту отправлен запрос на оценку визита (NULL — ещё не отправлялся).
+    review_requested_at: Mapped[dt.datetime | None] = mapped_column(UTCDateTime, default=None)
     created_at: Mapped[dt.datetime] = mapped_column(
         UTCDateTime,
         default=utcnow,

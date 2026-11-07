@@ -8,9 +8,11 @@ import logging
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.storage.base import BaseStorage
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.storage.redis import RedisStorage
+from aiogram.types import BotCommand, BotCommandScopeChat, BotCommandScopeDefault
 
 from src.core.config import Settings, get_settings
 from src.database import close_db, init_db
@@ -28,6 +30,26 @@ def build_storage(settings: Settings) -> BaseStorage:
         return RedisStorage.from_url(settings.REDIS_URL)
     logger.info("FSM: MemoryStorage")
     return MemoryStorage()
+
+
+async def setup_bot_commands(bot: Bot, settings: Settings) -> None:
+    """Меню команд: общее для всех и расширенное (debug) для администратора."""
+    public = [
+        BotCommand(command="start", description="Главное меню"),
+        BotCommand(command="book", description="Записаться"),
+    ]
+    admin = public + [
+        BotCommand(command="test_reminder_24h", description="Тест: напоминание за 24 часа"),
+        BotCommand(command="test_reminder_2h", description="Тест: напоминание за 2 часа"),
+        BotCommand(command="test_review", description="Тест: запрос оценки визита"),
+        BotCommand(command="test_digest", description="Тест: дайджест барберов"),
+    ]
+    try:
+        await bot.set_my_commands(public, scope=BotCommandScopeDefault())
+        await bot.set_my_commands(admin, scope=BotCommandScopeChat(chat_id=settings.ADMIN_ID))
+    except TelegramAPIError:
+        # Например, администратор ещё не писал боту: меню команд не критично для работы.
+        logger.warning("Не удалось настроить меню команд бота", exc_info=True)
 
 
 async def main() -> None:
@@ -54,6 +76,7 @@ async def main() -> None:
     dp = Dispatcher(storage=storage, crm=crm, settings=settings, session_factory=session_factory)
     for router in get_routers():
         dp.include_router(router)
+    await setup_bot_commands(bot, settings)
 
     try:
         await bot.send_message(

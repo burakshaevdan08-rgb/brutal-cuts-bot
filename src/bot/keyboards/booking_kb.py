@@ -33,6 +33,7 @@ from src.bot.common import (
     format_price,
     visit_total,
 )
+from src.bot.navigation import navigation_url
 from src.services.crm import Branch, Service, Staff
 
 PHONE_CANCEL_TEXT = "✖️ Отмена"
@@ -58,7 +59,7 @@ class BookingCB(CallbackData, prefix="bk"):
 
 
 class MyCB(CallbackData, prefix="my"):
-    """Мои записи: list | cancel | cancel_yes."""
+    """Мои записи: list | cancel | cancel_yes | resched."""
 
     action: str
     id: int = 0
@@ -144,13 +145,13 @@ def branch_card_kb(branch_id: int) -> InlineKeyboardMarkup:
 
 
 def branch_info_kb(branch_id: int) -> InlineKeyboardMarkup:
-    """Под карточкой в разделе «Филиалы» главного меню."""
-    return _markup(
-        [
-            [_btn("✂️ Записаться сюда", BookingCB(action="quick", value=str(branch_id)))],
-            [_btn("🏠 В меню", MenuCB(action="home"))],
-        ]
-    )
+    """Под карточкой в разделе «Филиалы» главного меню: запись, маршрут и возврат в меню."""
+    rows = [[_btn("✂️ Записаться сюда", BookingCB(action="quick", value=str(branch_id)))]]
+    route = navigation_url(branch_id)
+    if route:
+        rows.append([InlineKeyboardButton(text="🧭 Как добраться", url=route)])
+    rows.append([_btn("🏠 В меню", MenuCB(action="home"))])
+    return _markup(rows)
 
 
 # ----------------------------------------------------------------------
@@ -391,9 +392,15 @@ def visit_card_kb(appointment_id: int) -> InlineKeyboardMarkup:
 
 
 def my_appointments_kb(items: Sequence[tuple[int, str]]) -> InlineKeyboardMarkup:
-    """``items`` — пары (id записи, подпись для кнопки отмены)."""
+    """``items`` — пары (id записи, короткая подпись «5.11 · 18:30»).
+
+    Для каждой записи — строка из двух кнопок: перенести и отменить.
+    """
     rows = [
-        [_btn(f"❌ Отменить: {label}", MyCB(action="cancel", id=appointment_id))]
+        [
+            _btn(f"🔄 {label}", MyCB(action="resched", id=appointment_id)),
+            _btn(f"❌ {label}", MyCB(action="cancel", id=appointment_id)),
+        ]
         for appointment_id, label in items
     ]
     rows.append([_btn("✂️ Записаться", MenuCB(action="book"))])

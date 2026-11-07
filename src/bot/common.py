@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, TypeVar
+from typing import TYPE_CHECKING, Final, TypeVar
 from zoneinfo import ZoneInfo
 
 from aiogram.exceptions import TelegramBadRequest
@@ -35,6 +35,9 @@ from src.services.crm import (
     Staff,
     normalize_phone,
 )
+
+if TYPE_CHECKING:
+    from src.core.config import Settings
 
 T = TypeVar("T")
 
@@ -131,9 +134,72 @@ def esc(value: object) -> str:
     return html.escape(str(value), quote=False)
 
 
+def format_number(value: int) -> str:
+    """1240 → «1 240»."""
+    return f"{value:,}".replace(",", " ")
+
+
 def format_price(amount: int) -> str:
     """1800 → «1 800 ₽»."""
-    return f"{amount:,}".replace(",", " ") + " ₽"
+    return f"{format_number(amount)} ₽"
+
+
+# Имена мастеров из справочника склоняются по таблице, остальные — по простым правилам.
+_NAME_GENITIVE: Final[dict[str, str]] = {
+    "Марк": "Марка", "Артем": "Артема", "Артём": "Артёма", "Богдан": "Богдана",
+    "Денис": "Дениса", "Илья": "Ильи", "Влад": "Влада",
+}
+_NAME_DATIVE: Final[dict[str, str]] = {
+    "Марк": "Марку", "Артем": "Артему", "Артём": "Артёму", "Богдан": "Богдану",
+    "Денис": "Денису", "Илья": "Илье", "Влад": "Владу",
+}
+_CONSONANTS: Final[str] = "бвгджзклмнпрстфхцчшщ"
+
+
+def name_genitive(name: str) -> str:
+    """«Марк» → «Марка» (у мастера Марка)."""
+    if name in _NAME_GENITIVE:
+        return _NAME_GENITIVE[name]
+    last = name[-1:].lower()
+    if last in _CONSONANTS:
+        return name + "а"
+    if last in ("й", "ь"):
+        return name[:-1] + "я"
+    if last == "я":
+        return name[:-1] + "и"
+    if last == "а":
+        return name[:-1] + "ы"
+    return name
+
+
+def name_dative(name: str) -> str:
+    """«Марк» → «Марку» (оставить Марку на чай)."""
+    if name in _NAME_DATIVE:
+        return _NAME_DATIVE[name]
+    last = name[-1:].lower()
+    if last in _CONSONANTS:
+        return name + "у"
+    if last in ("й", "ь"):
+        return name[:-1] + "ю"
+    if last in ("я", "а"):
+        return name[:-1] + "е"
+    return name
+
+
+def visit_phrase(start: dt.datetime, service_name: str, today: dt.date) -> str:
+    """«сегодняшняя стрижка» / «вчерашний визит» — для запроса оценки.
+
+    ``start`` — начало визита в часовом поясе клуба.
+    """
+    day = start.date()
+    is_haircut = any(word in service_name.lower() for word in ("стрижк", "комплекс"))
+    if day == today:
+        adjective = "сегодняшняя" if is_haircut else "сегодняшний"
+    elif day == today - dt.timedelta(days=1):
+        adjective = "вчерашняя" if is_haircut else "вчерашний"
+    else:
+        adjective = "недавняя" if is_haircut else "недавний"
+    return f"{adjective} {'стрижка' if is_haircut else 'визит'}"
 
 
 def format_date_ru(day: dt.date) -> str:
@@ -438,6 +504,20 @@ async def show_screen(
         await delete_message(event)
         return await message.answer(text, reply_markup=reply_markup, link_preview_options=preview)
     return result if isinstance(result, Message) else message
+
+
+# ----------------------------------------------------------------------
+# Доступ администратора
+# ----------------------------------------------------------------------
+
+
+async def require_admin(message: Message, settings: Settings) -> bool:
+    """Пускает дальше только ADMIN_ID; остальным отвечает отказом."""
+    sender = message.from_user
+    if sender is None or sender.id != settings.ADMIN_ID:
+        await message.answer("⛔ Команда доступна только администратору.")
+        return False
+    return True
 
 
 # ----------------------------------------------------------------------

@@ -91,6 +91,25 @@ def yandex_navigator_url(latitude: float, longitude: float) -> str:
     return f"https://yandex.ru/maps/?rtext=~{latitude:.6f},{longitude:.6f}&rtt=auto"
 
 
+def yandex_maps_point_url(latitude: float, longitude: float) -> str:
+    """Ссылка на Яндекс.Карты с меткой в точке (в параметре ``pt`` сначала долгота, потом широта)."""
+    return f"https://yandex.ru/maps/?pt={longitude:.6f},{latitude:.6f}&z=17&l=map"
+
+
+def branch_maps_url(branch_id: int, overrides: dict[int, str] | None = None) -> str | None:
+    """Ссылка на Яндекс.Карты филиала.
+
+    Приоритет: ссылка из настроек (``BRANCH_REVIEW_URLS`` — страница отзывов организации),
+    иначе метка в точке филиала. Если про филиал ничего не известно — ``None``.
+    """
+    if overrides and branch_id in overrides:
+        return overrides[branch_id]
+    nav = NAVIGATION.get(branch_id)
+    if nav is None:
+        return None
+    return yandex_maps_point_url(nav.latitude, nav.longitude)
+
+
 def navigation_url(branch_id: int) -> str | None:
     """Ссылка на маршрут до филиала или None, если координаты неизвестны."""
     nav = NAVIGATION.get(branch_id)

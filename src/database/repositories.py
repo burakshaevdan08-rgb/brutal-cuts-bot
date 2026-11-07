@@ -589,6 +589,78 @@ class AppointmentRepository:
         )
         return int(result.rowcount or 0)
 
+    async def get_due_for_review(
+        self,
+        *,
+        delay: dt.timedelta,
+        lookback: dt.timedelta,
+        now: dt.datetime | None = None,
+        limit: int = 200,
+    ) -> list[Appointment]:
+        """Записи, по которым пора запросить оценку: визит закончился ``delay`` назад или раньше.
+
+        Подходят активные записи (created / confirmed), по которым запрос ещё не отправлялся.
+        ``lookback`` ограничивает давность визита, чтобы после долгого простоя бот
+        не засыпал клиентов запросами о давно прошедших визитах. Конец визита берётся
+        из ``datetime_end`` (для старых записей — начало + 1 час); сравнение делается
+        в Python, чтобы не зависеть от арифметики дат конкретной СУБД.
+        """
+        moment = _require_aware(now, "now") if now is not None else utcnow()
+        stmt = (
+            select(Appointment)
+            .where(
+                Appointment.status.in_(ACTIVE_STATUSES),
+                Appointment.review_requested_at.is_(None),
+                Appointment.datetime_start <= moment - delay,
+                Appointment.datetime_start > moment - lookback - MAX_VISIT_DURATION,
+            )
+            .order_by(Appointment.datetime_start.asc())
+            .limit(limit)
+        )
+        due: list[Appointment] = []
+        for appointment in (await self._session.execute(stmt)).scalars():
+            ended_at = appointment.datetime_end or appointment.datetime_start + DEFAULT_VISIT_DURATION
+            if ended_at + delay <= moment and ended_at > moment - lookback:
+                due.append(appointment)
+        return due
+
+    async def mark_review_requested(
+        self,
+        appointment_ids: Collection[int],
+        *,
+        requested_at: dt.datetime | None = None,
+    ) -> int:
+        """Помечает, что запрос на оценку отправлен. Возвращает число обновлённых записей."""
+        if not appointment_ids:
+            return 0
+        moment = _require_aware(requested_at, "requested_at") if requested_at is not None else utcnow()
+        result = await self._session.execute(
+            update(Appointment)
+            .where(Appointment.id.in_(list(appointment_ids)))
+            .values(review_requested_at=moment)
+        )
+        return int(result.rowcount or 0)
+
+    async def get_last_upcoming_for_user(
+        self,
+        user_id: int,
+        *,
+        now: dt.datetime | None = None,
+    ) -> Appointment | None:
+        """Последняя созданная будущая активная запись клиента (``datetime_start > now``)."""
+        moment = _require_aware(now, "now") if now is not None else utcnow()
+        stmt = (
+            select(Appointment)
+            .where(
+                Appointment.user_id == user_id,
+                Appointment.status.in_(ACTIVE_STATUSES),
+                Appointment.datetime_start > moment,
+            )
+            .order_by(Appointment.id.desc())
+            .limit(1)
+        )
+        return (await self._session.execute(stmt)).scalars().first()
+
     async def list_between(
         self,
         start: dt.datetime,
@@ -690,6 +762,15 @@ class ReviewRepository:
             feedback_text=text[:2000] or None,
         )
         self._session.add(review)
+        await self._session.flush()
+        return review
+
+    async def set_feedback(self, appointment_id: int, user_id: int, feedback_text: str) -> Review:
+        """Дописывает текст к уже сохранённому отзыву (например, претензию после оценки 1–3★)."""
+        review = await self.get_by_appointment(appointment_id)
+        if review is None or review.user_id != user_id:
+            raise EntityNotFoundError("Отзыв не найден.")
+        review.feedback_text = feedback_text.strip()[:2000] or None
         await self._session.flush()
         return review
 

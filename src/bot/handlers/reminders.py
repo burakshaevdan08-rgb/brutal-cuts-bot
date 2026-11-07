@@ -10,7 +10,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
-from src.bot.common import esc, format_visit_card, show_screen, view_from_appointment
+from src.bot.common import esc, format_visit_card, require_admin, show_screen, view_from_appointment
 from src.bot.handlers.booking import start_reschedule
 from src.bot.keyboards.booking_kb import to_menu_kb
 from src.bot.keyboards.reminder_kb import ReminderCB, reminder_24h_kb
@@ -127,18 +127,23 @@ async def on_reminder_reschedule(
 # ----------------------------------------------------------------------
 
 
-async def _admin_last_appointment(message: Message, settings: Settings) -> DbAppointment | None:
-    """Проверяет, что команду прислал администратор, и возвращает его последнюю запись."""
-    sender = message.from_user
-    if sender is None or sender.id != settings.ADMIN_ID:
-        await message.answer("⛔ Команда доступна только администратору.")
+async def _admin_last_upcoming(message: Message, settings: Settings) -> DbAppointment | None:
+    """Проверяет, что команду прислал администратор, и возвращает его последнюю БУДУЩУЮ запись.
+
+    Берётся последняя созданная активная запись с ``datetime_start > now()``:
+    прошедшие, завершённые и отменённые записи для проверки напоминаний не подходят.
+    """
+    if not await require_admin(message, settings):
         return None
 
     async with session_scope() as session:
-        appointment = await AppointmentRepository(session).get_last_for_user(sender.id)
+        appointment = await AppointmentRepository(session).get_last_upcoming_for_user(
+            message.from_user.id  # type: ignore[union-attr]
+        )
     if appointment is None:
         await message.answer(
-            "У вас пока нет записей. Создайте запись через «✂️ Записаться» и повторите команду."
+            "У вас нет будущих активных записей. "
+            "Создайте запись через «✂️ Записаться» и повторите команду."
         )
         return None
     return appointment
@@ -151,8 +156,8 @@ async def cmd_test_reminder_24h(
     crm: BaseCRMService,
     settings: Settings,
 ) -> None:
-    """Мгновенно присылает напоминание «за 24 часа» по последней записи администратора."""
-    appointment = await _admin_last_appointment(message, settings)
+    """Мгновенно присылает напоминание «за 24 часа» по последней будущей записи администратора."""
+    appointment = await _admin_last_upcoming(message, settings)
     if appointment is None:
         return
     try:
@@ -169,8 +174,8 @@ async def cmd_test_reminder_2h(
     crm: BaseCRMService,
     settings: Settings,
 ) -> None:
-    """Мгновенно присылает напоминание «за 2 часа» (карточка навигации)."""
-    appointment = await _admin_last_appointment(message, settings)
+    """Мгновенно присылает напоминание «за 2 часа» (карточка навигации) по последней будущей записи."""
+    appointment = await _admin_last_upcoming(message, settings)
     if appointment is None:
         return
     try:
@@ -188,9 +193,7 @@ async def cmd_test_digest(
     settings: Settings,
 ) -> None:
     """Мгновенно запускает утренний дайджест барберов (для проверки вёрстки)."""
-    sender = message.from_user
-    if sender is None or sender.id != settings.ADMIN_ID:
-        await message.answer("⛔ Команда доступна только администратору.")
+    if not await require_admin(message, settings):
         return
     stats = await send_barber_digests(bot, crm, settings)
     await message.answer(

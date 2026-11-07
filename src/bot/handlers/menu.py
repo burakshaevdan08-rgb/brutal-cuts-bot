@@ -18,7 +18,7 @@ from src.bot.common import (
     delete_message,
     esc,
     extract_verified_phone,
-    format_date_ru,
+    format_number,
     format_phone,
     format_visit_card,
     send_branch_card,
@@ -37,11 +37,14 @@ from src.bot.keyboards.booking_kb import (
     phone_request_kb,
     to_menu_kb,
 )
+from src.bot.handlers.booking import start_reschedule
+from src.bot.navigation import NAVIGATION
 from src.bot.states.booking import MenuStates
 from src.core.config import Settings
 from src.database import AppointmentRepository, BookingStatus, UserRepository, session_scope
 from src.services.booking_actions import cancel_visit
 from src.services.crm import BaseCRMService, CRMError
+from src.services.crm.base import plural_ru
 
 logger = logging.getLogger(__name__)
 
@@ -104,14 +107,17 @@ async def _show_balance(event: CallbackQuery | Message, crm: BaseCRMService, pho
         await show_screen(event, f"❌ {esc(exc)}", to_menu_kb())
         return
 
+    bonus_word = plural_ru(balance.points, "бонус", "бонуса", "бонусов")
     text = "\n".join(
         [
             "🎁 <b>Бонусы BRUTAL CUTS</b>",
             "",
+            f"У вас <b>{format_number(balance.points)}</b> {bonus_word}. "
+            "Вы можете списать их на кассе при следующем визите.",
+            "",
             f"📱 {format_phone(balance.phone)}",
             f"🏅 Уровень: <b>{esc(balance.tier)}</b> (скидка {balance.discount_percent}%)",
             f"✂️ Визитов: {balance.visits}",
-            f"💎 Баллов: <b>{balance.points}</b>",
         ]
     )
     await show_screen(event, text, to_menu_kb(with_booking=True))
@@ -129,7 +135,11 @@ async def on_balance(callback: CallbackQuery, state: FSMContext, crm: BaseCRMSer
         return
 
     await state.set_state(MenuStates.requesting_phone_for_balance)
-    await show_screen(callback, "🎁 <b>Бонусы BRUTAL CUTS</b>\n\nЧтобы показать баланс, нужен ваш номер телефона.")
+    await show_screen(
+        callback,
+        "🎁 <b>Бонусы BRUTAL CUTS</b>\n\n"
+        "Баланс привязан к номеру телефона. Поделитесь контактом, и я покажу, сколько у вас бонусов.",
+    )
     await send_new(callback, PHONE_PROMPT, phone_request_kb())
 
 
@@ -191,7 +201,11 @@ async def on_branches(callback: CallbackQuery, state: FSMContext, crm: BaseCRMSe
 
     for branch in branches:
         staff = await catalog.staff(crm, branch.id)
-        await send_branch_card(message, branch, branch_card(branch, staff), branch_info_kb(branch.id))
+        caption = branch_card(branch, staff)
+        navigation = NAVIGATION.get(branch.id)
+        if navigation is not None:
+            caption += f"\n🚪 {esc(navigation.entrance)}"
+        await send_branch_card(message, branch, caption, branch_info_kb(branch.id))
     await delete_message(callback)
 
 
@@ -200,9 +214,18 @@ async def on_branches(callback: CallbackQuery, state: FSMContext, crm: BaseCRMSe
 # ----------------------------------------------------------------------
 
 
+MY_APPOINTMENTS_LIMIT = 5
+
+
 async def _show_my_appointments(event: CallbackQuery, crm: BaseCRMService, settings: Settings) -> None:
     async with session_scope() as session:
-        items = await AppointmentRepository(session).list_upcoming_for_user(event.from_user.id, limit=5)
+        # На одну запись больше лимита: так видно, что есть и другие.
+        found = await AppointmentRepository(session).list_upcoming_for_user(
+            event.from_user.id,
+            limit=MY_APPOINTMENTS_LIMIT + 1,
+        )
+    items = found[:MY_APPOINTMENTS_LIMIT]
+    has_more = len(found) > MY_APPOINTMENTS_LIMIT
 
     if not items:
         await show_screen(
@@ -218,10 +241,12 @@ async def _show_my_appointments(event: CallbackQuery, crm: BaseCRMService, setti
     for appointment in items:
         view = view_from_appointment(appointment, branches.get(appointment.branch_id), settings.tzinfo)
         cards.append(format_visit_card(view, compact=True))
-        buttons.append(
-            (appointment.id, f"{format_date_ru(view.start.date())} {view.start:%H:%M}")
-        )
+        buttons.append((appointment.id, f"{view.start:%d.%m} · {view.start:%H:%M}"))
+
     text = "📋 <b>Мои записи</b>\n\n" + "\n\n".join(cards)
+    text += "\n\n<i>🔄 — перенести визит, ❌ — отменить.</i>"
+    if has_more:
+        text += f"\n<i>Показаны ближайшие {MY_APPOINTMENTS_LIMIT} записей.</i>"
     await show_screen(event, text, my_appointments_kb(buttons))
 
 
@@ -241,6 +266,27 @@ async def on_my_appointments(
 async def on_my_list(callback: CallbackQuery, crm: BaseCRMService, settings: Settings) -> None:
     await callback.answer()
     await _show_my_appointments(callback, crm, settings)
+
+
+@router.callback_query(MyCB.filter(F.action == "resched"))
+async def on_my_reschedule(
+    callback: CallbackQuery,
+    callback_data: MyCB,
+    state: FSMContext,
+    crm: BaseCRMService,
+    settings: Settings,
+) -> None:
+    """«🔄»: перенос визита с тем же мастером и услугой — выбираются только дата и время."""
+    async with session_scope() as session:
+        appointment = await AppointmentRepository(session).get(callback_data.id, user_id=callback.from_user.id)
+    if appointment is None:
+        await callback.answer("Запись не найдена.", show_alert=True)
+        return
+
+    await callback.answer()
+    error = await start_reschedule(callback, state, crm, settings, appointment)
+    if error is not None:
+        await show_screen(callback, f"⚠️ {esc(error)}", to_menu_kb(with_booking=True))
 
 
 @router.callback_query(MyCB.filter(F.action == "cancel"))
